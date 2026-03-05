@@ -6,7 +6,6 @@ CoWTracker Mask Propagation FastAPI Service (PATH INPUT VERSION)
 - Output: mp4 mask video
 - Optimizations:
   * json.loads for ffprobe
-  * PyAV decode frames in-memory (no PNG dump)
   * mask read once
   * CPU-safe autocast
   * GPU concurrency lock
@@ -665,6 +664,7 @@ class PropagatePathRequest(BaseModel):
 
     start_frame: int = 0
     end_frame: Optional[int] = None
+    mask_idx: int = 0
     enable_smoothing: bool = True
     close_radius: int = 51
     dilate_radius: int = 8
@@ -728,23 +728,81 @@ async def propagate_mask_from_paths(req: PropagatePathRequest):
         raise HTTPException(400, "No frames decoded")
 
     initial_mask = load_mask_gray(req.mask_path, (width, height))
+    mask_local_idx = int(req.mask_idx) - int(req.start_frame)
+    if mask_local_idx < 0 or mask_local_idx >= len(frames):
+        raise HTTPException(
+            400,
+            (
+                f"mask_idx out of decoded range: mask_idx={req.mask_idx}, "
+                f"decoded frame range=[{req.start_frame}, {req.start_frame + len(frames) - 1}]"
+            ),
+        )
 
     t_infer0 = time.time()
     async with GPU_LOCK:
-        masks = propagate_mask_with_cowtracker(
-            frames=frames,
-            initial_mask=initial_mask,
-            start_frame=0,
-            enable_temporal_smoothing=req.enable_smoothing,
-            visualize_tracks=req.visualize,
-            vis_output_path=None,
-            close_radius=req.close_radius,
-            dilate_radius=req.dilate_radius,
-            parallel_smoothing=req.parallel_smoothing,
-            smoothing_workers=req.smoothing_workers,
-            smoothing_chunk_size=req.smoothing_chunk_size,
-            tile_size=req.tile_size,
-        )
+        if mask_local_idx == 0:
+            masks = propagate_mask_with_cowtracker(
+                frames=frames,
+                initial_mask=initial_mask,
+                start_frame=0,
+                enable_temporal_smoothing=req.enable_smoothing,
+                visualize_tracks=req.visualize,
+                vis_output_path=None,
+                close_radius=req.close_radius,
+                dilate_radius=req.dilate_radius,
+                parallel_smoothing=req.parallel_smoothing,
+                smoothing_workers=req.smoothing_workers,
+                smoothing_chunk_size=req.smoothing_chunk_size,
+                tile_size=req.tile_size,
+            )
+        else:
+            logger.info(
+                f"Using split propagation from mask_idx={req.mask_idx} "
+                f"(local_idx={mask_local_idx} in decoded chunk)"
+            )
+
+            # Forward: [mask_idx .. end]
+            forward_frames = frames[mask_local_idx:]
+            forward_masks = propagate_mask_with_cowtracker(
+                frames=forward_frames,
+                initial_mask=initial_mask,
+                start_frame=0,
+                enable_temporal_smoothing=req.enable_smoothing,
+                visualize_tracks=False,
+                vis_output_path=None,
+                close_radius=req.close_radius,
+                dilate_radius=req.dilate_radius,
+                parallel_smoothing=req.parallel_smoothing,
+                smoothing_workers=req.smoothing_workers,
+                smoothing_chunk_size=req.smoothing_chunk_size,
+                tile_size=req.tile_size,
+            )
+
+            # Backward by reversing [0 .. mask_idx] -> [mask_idx .. 0].
+            backward_input_frames = frames[: mask_local_idx + 1][::-1]
+            backward_masks_reversed = propagate_mask_with_cowtracker(
+                frames=backward_input_frames,
+                initial_mask=initial_mask,
+                start_frame=0,
+                enable_temporal_smoothing=req.enable_smoothing,
+                visualize_tracks=False,
+                vis_output_path=None,
+                close_radius=req.close_radius,
+                dilate_radius=req.dilate_radius,
+                parallel_smoothing=req.parallel_smoothing,
+                smoothing_workers=req.smoothing_workers,
+                smoothing_chunk_size=req.smoothing_chunk_size,
+                tile_size=req.tile_size,
+            )
+            backward_masks = backward_masks_reversed[::-1]  # [0 .. mask_idx]
+
+            # Merge without duplicating mask_idx frame.
+            masks = backward_masks[:-1] + forward_masks
+            if len(masks) != len(frames):
+                raise HTTPException(
+                    500,
+                    f"Merged mask length mismatch: got {len(masks)} expected {len(frames)}",
+                )
     infer_s = time.time() - t_infer0
 
     save_t0 = time.time()
