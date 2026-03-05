@@ -1,73 +1,58 @@
 #!/usr/bin/env python3
 """
-CoWTracker Mask Propagation FastAPI Service
+CoWTracker Mask Propagation FastAPI Service (PATH INPUT VERSION)
 
-A REST API service for propagating masks through video frames using CoWTracker DENSE tracking.
-The model is loaded once at startup and reused for all requests.
+- Input: server-local video_path + mask_path (no UploadFile)
+- Output: mp4 mask video
+- Optimizations:
+  * json.loads for ffprobe
+  * PyAV decode frames in-memory (no PNG dump)
+  * mask read once
+  * CPU-safe autocast
+  * GPU concurrency lock
+  * BackgroundTasks cleanup temp dir
 
-Usage:
-    # Start the server
-    python cowtracker_fastapi.py --host 0.0.0.0 --port 8000
+Run:
+  python cowtracker_fastapi_paths.py --host 0.0.0.0 --port 8000
 
-    # Make requests using Python requests library
-    import requests
-
-    # Simple request
-    with open("video.mp4", "rb") as video, open("mask.png", "rb") as mask:
-        response = requests.post(
-            "http://localhost:8000/propagate",
-            files={"video": video, "mask": mask},
-            data={"enable_smoothing": "true"}
-        )
-    output_video = response.content
-
-    # With options
-    with open("video.mp4", "rb") as video, open("mask.png", "rb") as mask:
-        response = requests.post(
-            "http://localhost:8000/propagate",
-            files={"video": video, "mask": mask},
-            data={
-                "start_frame": 0,
-                "enable_smoothing": "true",
-                "close_radius": 51,
-                "dilate_radius": 8,
-                "visualize": "false"
-            }
-        )
-    with open("output.mp4", "wb") as f:
-        f.write(response.content)
+Request example:
+  curl -X POST "http://localhost:8000/propagate_path" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "video_path": "/path/to/video.mp4",
+      "mask_path": "/path/to/mask.png",
+      "start_frame": 0,
+      "end_frame": 120,
+      "enable_smoothing": true,
+      "close_radius": 51,
+      "dilate_radius": 8,
+      "visualize": false
+    }' --output out.mp4
 """
-# import debugpy
-# debugpy.listen(("0.0.0.0", 7780))
-# print("Debugger attached, running…")
-# debugpy.wait_for_client()  # 连接前阻塞，可选
 
 import argparse
+import asyncio
 import io
+import json
 import logging
 import os
 import shutil
 import tempfile
 import time
 import uuid
-from contextlib import asynccontextmanager
-from typing import List, Optional
+from contextlib import asynccontextmanager, nullcontext
+from typing import List, Optional, Tuple
 
-# Configure logging with timestamp
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger("cowtracker_api")
-
-import cv2
-import imageio.v2 as imageio
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+import cv2
+import imageio.v2 as imageio
+import subprocess
+import numpy as np
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from PIL import Image
 
 # Import CoWTracker and utilities
@@ -78,67 +63,66 @@ from cowtracker.utils.padding import (
     remove_padding_and_scale_back,
 )
 
+# ---------------- logging ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("cowtracker_api")
 
-# ============================================================
-# ---------------------- Global State ------------------------
-# ============================================================
-# Global model instance (loaded once at startup)
+# ---------------- global model state ----------------
 GLOBAL_MODEL = None
 GLOBAL_DEVICE = None
 GLOBAL_DTYPE = None
 MODEL_CHECKPOINT = None
 
+GPU_LOCK = asyncio.Lock()
+
 
 def initialize_model(checkpoint_path: Optional[str] = None):
-    """Initialize and load the CoWTracker model once at startup."""
+    """Load the CoWTracker model once at startup."""
     global GLOBAL_MODEL, GLOBAL_DEVICE, GLOBAL_DTYPE, MODEL_CHECKPOINT
 
+    MODEL_CHECKPOINT = checkpoint_path
     GLOBAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     GLOBAL_DTYPE = torch.float16 if GLOBAL_DEVICE == "cuda" else torch.float32
-    MODEL_CHECKPOINT = checkpoint_path
 
-    logger.info(f"{'='*60}")
-    logger.info(f"Initializing CoWTracker model on {GLOBAL_DEVICE}...")
-    logger.info(f"{'='*60}")
+    logger.info("=" * 60)
+    logger.info(f"Initializing CoWTracker model on {GLOBAL_DEVICE} ...")
+    logger.info("=" * 60)
 
-    try:
-        GLOBAL_MODEL = CoWTracker.from_checkpoint(
-            MODEL_CHECKPOINT,  # Downloads from HuggingFace by default if None
-            device=GLOBAL_DEVICE,
-            dtype=GLOBAL_DTYPE,
-        )
-        logger.info("Model loaded successfully!")
-    except Exception as e:
-        logger.error(f"Failed to load CoWTracker: {e}")
-        raise
+    GLOBAL_MODEL = CoWTracker.from_checkpoint(
+        MODEL_CHECKPOINT,  # None -> download default
+        device=GLOBAL_DEVICE,
+        dtype=GLOBAL_DTYPE,
+    )
+    GLOBAL_MODEL.eval()
+    logger.info("Model loaded successfully!")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup and shutdown events."""
-    # Startup
     logger.info("Starting CoWTracker FastAPI Service...")
-    initialize_model()
+    initialize_model(MODEL_CHECKPOINT)
     yield
-    # Shutdown
     logger.info("Shutting down CoWTracker FastAPI Service...")
 
 
-# Create FastAPI app with lifespan
 app = FastAPI(
-    title="CoWTracker Mask Propagation API",
-    description="REST API for propagating masks through videos using CoWTracker DENSE tracking",
+    title="CoWTracker Mask Propagation API (Path Input)",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 
 # ============================================================
-# ---------------------- ffmpeg helpers ----------------------
+# ---------------------- helpers -----------------------------
 # ============================================================
 def run_cmd(cmd: List[str]) -> str:
-    """Run a shell command and return stdout."""
+    """Run command and return stdout, raise on non-zero."""
     import subprocess
+
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
         raise RuntimeError(
@@ -147,102 +131,152 @@ def run_cmd(cmd: List[str]) -> str:
     return p.stdout
 
 
-def probe_video(video_path: str):
-    """Get video metadata: duration, fps, width, height."""
-    out = run_cmd(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height,r_frame_rate,avg_frame_rate",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-            video_path,
-        ]
-    )
-    data = eval(out.replace("null", "None").replace("true", "True").replace("false", "False"))
+def probe_video(video_path):
+    out = run_cmd([
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-count_frames",
+        "-show_entries", "stream=width,height,avg_frame_rate,nb_read_frames",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        video_path,
+    ])
+
+    data = json.loads(out)
+
     stream = data["streams"][0]
+
     w = int(stream["width"])
     h = int(stream["height"])
+
     duration = float(data["format"]["duration"])
 
-    def parse_rate(s: str) -> float:
+    def parse_rate(s):
         if not s or s == "0/0":
             return 0.0
-        num, den = s.split("/")
-        return float(num) / float(den)
+        a, b = s.split("/")
+        return float(a) / float(b)
 
-    fps = parse_rate(stream.get("avg_frame_rate", "")) or parse_rate(stream.get("r_frame_rate", "")) or 24.0
-    return duration, float(fps), w, h
+    fps = parse_rate(stream.get("avg_frame_rate"))
 
+    total_frames = int(stream.get("nb_read_frames", 0))
 
-def extract_all_frames(video_path: str, fps: float, out_dir: str) -> None:
-    """Extract all frames from video to a directory."""
-    os.makedirs(out_dir, exist_ok=True)
-    run_cmd(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            video_path,
-            "-vf",
-            f"fps={fps}",
-            "-start_number",
-            "0",
-            os.path.join(out_dir, "%06d.png"),
-        ]
-    )
+    return duration, fps, w, h, total_frames
 
 
-def encode_masks_to_video(
-    masks: List[np.ndarray],
-    fps: float,
-    output_path: str,
-) -> str:
-    """Encode a list of mask arrays to a video file."""
+def ffprobe_wh(path: str):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        path
+    ]
+    out = subprocess.check_output(cmd)
+    info = json.loads(out.decode())
+    st = info["streams"][0]
+    return int(st["width"]), int(st["height"])
+
+def read_rgb_frames(video_path: str, start_frame: int = 0, end_frame: int | None = None):
+    """
+    Read RGB frames from video using ffmpeg pipe.
+
+    Returns:
+        List[np.ndarray]  (H,W,3) uint8
+    """
+
+    w, h = ffprobe_wh(video_path)
+
+    if end_frame is None:
+        vf = f"select='gte(n\\,{start_frame})'"
+    else:
+        vf = f"select='between(n\\,{start_frame}\\,{end_frame})'"
+
+    cmd = [
+        "ffmpeg",
+        "-v", "error",
+        "-nostdin",
+        "-i", video_path,
+        "-vf", vf,
+        "-vsync", "0",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "pipe:1",
+    ]
+
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    frame_bytes = w * h * 3
+    frames = []
+
+    try:
+        while True:
+            buf = p.stdout.read(frame_bytes)
+            if len(buf) != frame_bytes:
+                break
+
+            frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            frames.append(frame)
+
+    finally:
+        p.stdout.close()
+        stderr = p.stderr.read()
+        p.stderr.close()
+        ret = p.wait()
+
+        if ret != 0:
+            raise RuntimeError(
+                f"ffmpeg failed:\n{stderr.decode('utf-8', errors='ignore')}"
+            )
+
+    return frames
+
+
+
+def load_mask_gray(mask_path: str, target_size: Tuple[int, int]) -> np.ndarray:
+    """Load mask image -> grayscale uint8 {0,255}, resized to target_size (W,H)."""
+    im = Image.open(mask_path)
+    if im.size != target_size:
+        im = im.resize(target_size, resample=Image.NEAREST)
+    m = np.array(im.convert("L"), dtype=np.uint8)
+    return (m > 127).astype(np.uint8) * 255
+
+
+def encode_masks_to_video(masks: List[np.ndarray], fps: float, output_path: str) -> str:
+    """Encode grayscale masks to mp4 (RGB in writer)."""
     if not masks:
         raise ValueError("No masks to encode")
 
-    h, w = masks[0].shape[:2]
     writer = imageio.get_writer(
         output_path,
-        fps=fps,
+        fps=float(fps),
         codec="libx264",
         quality=5,
         pixelformat="yuv420p",
-        ffmpeg_params=["-preset", "fast", "-crf", "23"]
+        ffmpeg_params=["-preset", "fast", "-crf", "23"],
     )
 
     try:
         for mask in masks:
-            # Ensure RGB format for video encoding
             if mask.ndim == 2:
                 mask_rgb = np.stack([mask, mask, mask], axis=-1)
             else:
-                mask_rgb = mask
+                mask_rgb = mask[..., :3]
             writer.append_data(mask_rgb.astype(np.uint8))
     finally:
         writer.close()
-
     return output_path
 
 
-# ============================================================
-# ---------------------- Mask Post-Processing ----------------
-# ============================================================
-def close_then_dilate(mask, close_radius=6, dilate_radius=8):
-    """Apply morphological closing followed by dilation to a mask."""
+def close_then_dilate(mask: np.ndarray, close_radius=6, dilate_radius=8) -> np.ndarray:
+    """Morph close then dilate (expects 2D mask)."""
     if mask.ndim == 3:
         mask = mask[..., 0]
     mask = (mask > 0).astype(np.uint8) * 255
 
-    k1 = 2 * close_radius + 1
-    k2 = 2 * dilate_radius + 1
+    k1 = 2 * int(close_radius) + 1
+    k2 = 2 * int(dilate_radius) + 1
     ker1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k1, k1))
     ker2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))
 
@@ -251,9 +285,6 @@ def close_then_dilate(mask, close_radius=6, dilate_radius=8):
     return mask
 
 
-# ============================================================
-# ---------------------- Core Tracking Function --------------
-# ============================================================
 def propagate_mask_with_cowtracker(
     frames: List[np.ndarray],
     initial_mask: np.ndarray,
@@ -265,348 +296,229 @@ def propagate_mask_with_cowtracker(
     dilate_radius: int = 8,
 ) -> List[np.ndarray]:
     """
-    Propagate a mask through video frames using CoWTracker DENSE tracking.
-    Uses the global model instance.
+    Propagate mask through frames using GLOBAL_MODEL (CoWTracker).
+    frames: list of RGB uint8 [H,W,3]
+    initial_mask: uint8 [H,W] {0,255} at start_frame (usually 0 within the provided chunk)
     """
     if GLOBAL_MODEL is None:
-        raise RuntimeError("Model not initialized. Call initialize_model() first.")
+        raise RuntimeError("Model not initialized")
 
     num_frames = len(frames)
     H, W = frames[0].shape[:2]
+    logger.info(f"CoWTracker tracking chunk: {num_frames} frames @ {H}x{W}, query={start_frame}")
 
-    logger.info(f"{'='*60}")
-    logger.info(f"CoWTracker DENSE Tracking: {num_frames} frames @ {H}x{W}")
-    logger.info(f"Query frame: {start_frame}")
-    logger.info(f"{'='*60}")
-
-    # Prepare video tensor for CoWTracker
-    frames_np = np.stack(frames)  # [T, H, W, 3]
-    frames_tensor = torch.tensor(frames_np).unsqueeze(0).to(GLOBAL_DTYPE)  # [1, T, H, W, 3]
-
-    # CoWTracker expects [B, T, C, H, W]
-    video_tensor = frames_tensor.permute(0, 1, 4, 2, 3)  # [1, T, 3, H, W]
+    # video tensor [1,T,3,H,W]
+    frames_np = np.stack(frames)  # [T,H,W,3]
+    video_tensor = torch.from_numpy(frames_np).unsqueeze(0).to(GLOBAL_DTYPE)  # [1,T,H,W,3]
+    video_tensor = video_tensor.permute(0, 1, 4, 2, 3).contiguous()  # [1,T,3,H,W]
     T = video_tensor.shape[1]
 
-    # Configure inference size and padding
+    # padding setup
     inf_H, inf_W = 336, 560
-    skip_upscaling = True
+    padding_info = compute_padding_params(H, W, inf_H, inf_W, skip_upscaling=True)
 
-    # Compute padding parameters
-    padding_info = compute_padding_params(
-        H, W, inf_H, inf_W, skip_upscaling=skip_upscaling
+    # store device (keep on GPU if available to reduce transfers)
+    store_device = GLOBAL_DEVICE if GLOBAL_DEVICE == "cuda" else "cpu"
+    traj_maps_e = torch.zeros((1, T, inf_H, inf_W, 2), dtype=torch.float32, device=store_device)
+    visconf_maps_e = torch.zeros((1, T, inf_H, inf_W), dtype=torch.float32, device=store_device)
+
+    # autocast safe
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+        if GLOBAL_DEVICE == "cuda"
+        else nullcontext()
     )
 
-    logger.info(f"Original size: {H}x{W}")
-    logger.info(f"Inference size: {inf_H}x{inf_W}")
-    logger.info(f"Scale factor: {padding_info['scale']:.4f}")
+    query_frame = int(start_frame)
 
-    # Initialize output tensors
-    traj_maps_e = torch.zeros(
-        (1, T, inf_H, inf_W, 2), dtype=torch.float32, device="cpu"
-    )
-    visconf_maps_e = torch.zeros(
-        (1, T, inf_H, inf_W), dtype=torch.float32, device="cpu"
-    )
-
-    query_frame = start_frame
-
-    start = time.time()
+    t0 = time.time()
     with torch.no_grad():
-        # Forward pass
+        # forward
         if query_frame < T - 1:
-            logger.info(f"Forward pass: frames {query_frame} -> {T-1}")
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                forward_video = video_tensor[0, query_frame:]
+            with autocast_ctx:
+                forward_video = video_tensor[0, query_frame:]  # [Tf,3,H,W]
                 forward_video_padded = apply_padding(forward_video, padding_info).to(GLOBAL_DEVICE)
 
-                predictions = GLOBAL_MODEL.forward(
-                    video=forward_video_padded,
-                    queries=None,
-                )
+                pred = GLOBAL_MODEL.forward(video=forward_video_padded, queries=None)
+                tracks_dense = pred["track"][0]           # [Tf,inf_H,inf_W,2] (device=GLOBAL_DEVICE)
+                visibility_dense = pred["vis"][0]
+                confidence_dense = pred["conf"][0]
 
-                tracks_dense = predictions["track"][0]
-                visibility_dense = predictions["vis"][0]
-                confidence_dense = predictions["conf"][0]
+                Tf = tracks_dense.shape[0]
+                traj_maps_e[0, query_frame: query_frame + Tf] = tracks_dense.to(store_device)
+                visconf_maps_e[0, query_frame: query_frame + Tf] = (visibility_dense * confidence_dense).to(store_device)
 
-                T_forward = tracks_dense.shape[0]
-                traj_maps_e[0, query_frame : query_frame + T_forward] = tracks_dense.cpu()
-                visconf_maps_e[0, query_frame : query_frame + T_forward] = (
-                    visibility_dense * confidence_dense
-                ).cpu()
-
-        # Backward pass
+        # backward
         if query_frame > 0:
-            logger.info(f"Backward pass: frames {query_frame} -> 0")
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            with autocast_ctx:
                 backward_video = video_tensor[0, : query_frame + 1].flip([0])
                 backward_video_padded = apply_padding(backward_video, padding_info).to(GLOBAL_DEVICE)
 
-                predictions = GLOBAL_MODEL.forward(
-                    video=backward_video_padded,
-                    queries=None,
-                )
+                pred = GLOBAL_MODEL.forward(video=backward_video_padded, queries=None)
+                tracks_dense = pred["track"][0]
+                visibility_dense = pred["vis"][0]
+                confidence_dense = pred["conf"][0]
 
-                tracks_dense = predictions["track"][0]
-                visibility_dense = predictions["vis"][0]
-                confidence_dense = predictions["conf"][0]
-
-                backward_tracks = tracks_dense.flip([0]).cpu()
-                backward_visconf = (visibility_dense * confidence_dense).flip([0]).cpu()
+                backward_tracks = tracks_dense.flip([0]).to(store_device)
+                backward_visconf = (visibility_dense * confidence_dense).flip([0]).to(store_device)
 
                 end_idx = query_frame if query_frame < T - 1 else query_frame + 1
                 traj_maps_e[0, :end_idx] = backward_tracks[:end_idx]
                 visconf_maps_e[0, :end_idx] = backward_visconf[:end_idx]
 
-    # Remove padding and scale back
-    logger.info(f"Unpadding and scaling back to {H}x{W}")
+    # remove padding and scale back (do on CPU to be safe)
+    traj_cpu = traj_maps_e[0].to("cpu")
+    visconf_cpu = visconf_maps_e[0].to("cpu")
+
     tracks_final, _, confidence_final = remove_padding_and_scale_back(
-        traj_maps_e[0],
-        torch.ones_like(visconf_maps_e[0]),
-        visconf_maps_e[0],
+        traj_cpu,
+        torch.ones_like(visconf_cpu),  # dummy vis
+        visconf_cpu,
         padding_info,
     )
 
-    end = time.time()
-    logger.info(f"Full tracking time: {end - start:.2f}s")
+    logger.info(f"Tracking done in {time.time() - t0:.2f}s")
 
-    # Convert to numpy
-    tracks_np = tracks_final.permute(1, 2, 0, 3).numpy()  # [H, W, T, 2]
-    conf_np = confidence_final.permute(1, 2, 0).numpy()  # [H, W, T]
+    # tracks_final: [T,H,W,2]?  (based on your original usage you permute later)
+    tracks_np = tracks_final.permute(1, 2, 0, 3).numpy()   # [H,W,T,2]
+    conf_np = confidence_final.permute(1, 2, 0).numpy()    # [H,W,T]
 
-    # Extract pixels from initial mask
-    mask_pixels = np.argwhere(initial_mask > 127)
-    logger.info(f"Initial mask has {len(mask_pixels)} pixels")
-
+    mask_pixels = np.argwhere(initial_mask > 127)  # [N,2] (y,x)
     if len(mask_pixels) == 0:
-        logger.warning("Initial mask is empty!")
+        logger.warning("Initial mask empty")
         return [np.zeros((H, W), dtype=np.uint8) for _ in range(num_frames)]
 
-    # Propagate mask for each frame
-    masks = []
-    vis_frames = []
+    masks_out: List[np.ndarray] = []
 
     for t in range(num_frames):
-        mask_t = np.zeros((H, W), dtype=np.uint8)
-        placed = 0
-
-        # For frame 0, use initial mask directly
         if t == 0:
             mask_t = initial_mask.copy()
-            placed = (mask_t > 127).sum()
-            logger.info(f"Frame {t}: Using initial mask directly ({placed} pixels)")
         else:
+            mask_t = np.zeros((H, W), dtype=np.uint8)
             for my, mx in mask_pixels:
-                tracked_x, tracked_y = tracks_np[my, mx, t]
-                ix, iy = int(tracked_x), int(tracked_y)
-                if 0 <= ix < W and 0 <= iy < H:
-                    if conf_np[my, mx, t] > 0.1:
-                        mask_t[iy, ix] = 255
-                        placed += 1
+                tx, ty = tracks_np[my, mx, t]
+                ix, iy = int(tx), int(ty)
+                if 0 <= ix < W and 0 <= iy < H and conf_np[my, mx, t] > 0.1:
+                    mask_t[iy, ix] = 255
 
-        # Morphological smoothing (skip for frame 0)
-        if enable_temporal_smoothing and placed > 0 and t != 0:
-            mask_t = close_then_dilate(mask_t, close_radius=close_radius, dilate_radius=dilate_radius)
+            if enable_temporal_smoothing:
+                mask_t = close_then_dilate(mask_t, close_radius=close_radius, dilate_radius=dilate_radius)
 
-        masks.append(mask_t)
+        masks_out.append(mask_t)
 
-        # Create visualization if requested
-        if visualize_tracks:
-            vis_frame = frames[t].copy()
-            try:
-                import matplotlib.colormaps as cm
-                cmap = cm["gist_rainbow"]
-                for i, (my, mx) in enumerate(mask_pixels[::20]):
-                    color = np.array(cmap(i / len(mask_pixels))[:3]) * 255
-                    for ft in range(num_frames):
-                        tx, ty = tracks_np[my, mx, ft]
-                        if 0 <= int(tx) < W and 0 <= int(ty) < H:
-                            cv2.circle(vis_frame, (int(tx), int(ty)), 1, color, -1)
-            except ImportError:
-                pass
-            vis_frames.append(vis_frame)
+    # optional visualization (kept minimal)
+    if visualize_tracks and vis_output_path:
+        try:
+            writer = imageio.get_writer(vis_output_path, fps=15, codec="libx264", quality=5)
+            for fr, m in zip(frames, masks_out):
+                vis = fr.copy()
+                ys, xs = np.where(m > 127)
+                # draw a few points
+                for y, x in zip(ys[:: max(1, len(ys)//800)], xs[:: max(1, len(xs)//800)]):
+                    cv2.circle(vis, (int(x), int(y)), 1, (255, 0, 0), -1)
+                writer.append_data(vis)
+            writer.close()
+        except Exception as e:
+            logger.warning(f"Visualization failed: {e}")
 
-    # Save visualization
-    if visualize_tracks and vis_output_path and vis_frames:
-        logger.info(f"Saving visualization to {vis_output_path}")
-        writer = imageio.get_writer(vis_output_path, fps=15, codec="libx264", quality=5)
-        for vf in vis_frames:
-            writer.append_data(vf)
-        writer.close()
-
-    return masks
-
-
-def load_mask_from_bytes(mask_bytes: bytes, target_size: Optional[tuple] = None) -> np.ndarray:
-    """Load a mask from bytes and convert to grayscale."""
-    mask = Image.open(io.BytesIO(mask_bytes))
-    if target_size is not None:
-        mask = mask.resize(target_size, resample=Image.NEAREST)
-    mask = np.array(mask.convert("L"))
-    return (mask > 127).astype(np.uint8) * 255
+    return masks_out
 
 
 # ============================================================
-# ---------------------- API Endpoints -----------------------
+# ---------------------- API schema --------------------------
 # ============================================================
-@app.get("/")
-async def root():
-    """Root endpoint with API information."""
-    return {
-        "name": "CoWTracker Mask Propagation API",
-        "version": "1.0.0",
-        "status": "ready",
-        "model_loaded": GLOBAL_MODEL is not None,
-        "device": GLOBAL_DEVICE,
-        "endpoints": {
-            "/propagate": "POST - Propagate mask through video",
-            "/health": "GET - Health check",
-            "/docs": "GET - API documentation (Swagger UI)"
-        }
-    }
+class PropagatePathRequest(BaseModel):
+    video_path: str
+    mask_path: str
+    output_path: str
+
+    start_frame: int = 0
+    end_frame: Optional[int] = None
+    enable_smoothing: bool = True
+    close_radius: int = 51
+    dilate_radius: int = 8
+    visualize: bool = False
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
     return {
-        "status": "healthy",
+        "status": "ok",
         "model_loaded": GLOBAL_MODEL is not None,
-        "device": GLOBAL_DEVICE
+        "device": GLOBAL_DEVICE,
+        "dtype": str(GLOBAL_DTYPE),
     }
 
 
-@app.post("/propagate")
-async def propagate_mask_endpoint(
-    video: UploadFile = File(..., description="Input video file (mp4, avi, mov, etc.)"),
-    mask: UploadFile = File(..., description="Initial mask image (png, jpg, etc.)"),
-    start_frame: int = Form(0, description="Frame index where mask is defined"),
-    end_frame: Optional[int] = Form(None, description="End frame index (default: end of video)"),
-    enable_smoothing: bool = Form(True, description="Apply morphological smoothing"),
-    close_radius: int = Form(51, description="Morphological closing radius"),
-    dilate_radius: int = Form(8, description="Morphological dilation radius"),
-    visualize: bool = Form(False, description="Create track visualization"),
-):
-    """
-    Propagate a mask through a video using CoWTracker.
+@app.post("/propagate_path")
+async def propagate_mask_from_paths(req: PropagatePathRequest):
 
-    Returns the output mask video as a file download.
-    """
     if GLOBAL_MODEL is None:
         raise HTTPException(status_code=503, detail="Model not initialized")
 
-    # Create temporary directory for this request
-    request_id = uuid.uuid4().hex[:8]
-    tmp_dir = tempfile.mkdtemp(prefix=f"cowtracker_api_{request_id}_")
+    if not os.path.exists(req.video_path):
+        raise HTTPException(400, f"video_path not found: {req.video_path}")
 
-    try:
-        # Save uploaded files
-        video_path = os.path.join(tmp_dir, f"input_{video.filename}")
-        mask_path = os.path.join(tmp_dir, f"mask_{mask.filename}")
+    if not os.path.exists(req.mask_path):
+        raise HTTPException(400, f"mask_path not found: {req.mask_path}")
 
-        with open(video_path, "wb") as f:
-            f.write(await video.read())
-        with open(mask_path, "wb") as f:
-            f.write(await mask.read())
+    output_path = req.output_path
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-        logger.info(f"[{request_id}] Processing request...")
-        logger.info(f"[{request_id}] Video: {video.filename}")
-        logger.info(f"[{request_id}] Mask: {mask.filename}")
+    duration, fps, width, height, total_frames = probe_video(req.video_path)
 
-        # Get video metadata
-        duration, fps, width, height = probe_video(video_path)
-        total_frames = int(duration * fps)
+    end_frame = req.end_frame if req.end_frame is not None else (total_frames - 1)
 
-        if end_frame is None:
-            end_frame = total_frames - 1
+    logger.info(f"video={req.video_path}")
+    logger.info(f"mask={req.mask_path}")
+    logger.info(f"output={output_path}")
 
-        logger.info(f"[{request_id}] Video: {total_frames} frames @ {fps} fps, {width}x{height}")
-        logger.info(f"[{request_id}] Processing frames {start_frame} -> {end_frame}")
+    # decode frames
+    frames = read_rgb_frames(req.video_path, req.start_frame, end_frame)
 
-        # Extract frames
-        frames_dir = os.path.join(tmp_dir, "frames")
-        logger.info(f"[{request_id}] Extracting frames...")
-        extract_all_frames(video_path, fps, frames_dir)
+    if not frames:
+        raise HTTPException(400, "No frames decoded")
 
-        # Load frames
-        frames = []
-        for i in range(start_frame, end_frame + 1):
-            frame_path = os.path.join(frames_dir, f"{i:06d}.png")
-            if os.path.exists(frame_path):
-                frames.append(np.array(Image.open(frame_path).convert("RGB")))
+    initial_mask = load_mask_gray(req.mask_path, (width, height))
 
-        if not frames:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No frames found in range {start_frame}-{end_frame}"
-            )
-
-        logger.info(f"[{request_id}] Loaded {len(frames)} frames")
-
-        # Load initial mask from file
-        initial_mask = load_mask_from_bytes(
-            await mask.read() if False else open(mask_path, "rb").read(),
-            (width, height)
-        )
-        logger.info(f"[{request_id}] Loaded initial mask: {initial_mask.shape}")
-
-        # Run CoWTracker tracking
+    async with GPU_LOCK:
         masks = propagate_mask_with_cowtracker(
             frames=frames,
             initial_mask=initial_mask,
             start_frame=0,
-            enable_temporal_smoothing=enable_smoothing,
-            visualize_tracks=visualize,
-            vis_output_path=os.path.join(tmp_dir, "visualization.mp4") if visualize else None,
-            close_radius=close_radius,
-            dilate_radius=dilate_radius,
+            enable_temporal_smoothing=req.enable_smoothing,
+            visualize_tracks=req.visualize,
+            vis_output_path=None,
+            close_radius=req.close_radius,
+            dilate_radius=req.dilate_radius,
         )
 
-        # Encode masks to video
-        output_path = os.path.join(tmp_dir, "output.mp4")
-        logger.info(f"[{request_id}] Encoding output video...")
-        encode_masks_to_video(masks, fps, output_path)
+    encode_masks_to_video(masks, fps, output_path)
 
-        logger.info(f"[{request_id}] Done! Returning output video")
+    logger.info(f"Saved output to {output_path}")
 
-        # Return the video file
-        return FileResponse(
-            output_path,
-            media_type="video/mp4",
-            filename=f"cowtracker_output_{request_id}.mp4",
-            background=None  # Will be cleaned up after response
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[{request_id}] ERROR: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Schedule cleanup (don't do it immediately as FileResponse needs the file)
-        # The temp file will be cleaned up by the OS eventually, or you can implement
-        # a background task to clean it up after a delay
-        pass
-
-
+    return {
+        "status": "success",
+        "output_path": output_path,
+        "frames": len(masks),
+        "fps": fps
+    }
 # ============================================================
-# ---------------------- Main Entry Point --------------------
+# ---------------------- main entry --------------------------
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description="CoWTracker Mask Propagation FastAPI Service"
-    )
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
-    parser.add_argument("--checkpoint", "-c", type=str, default=None, help="Path to model checkpoint")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
+    parser = argparse.ArgumentParser(description="CoWTracker FastAPI (path input)")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--checkpoint", "-c", type=str, default=None)
+    parser.add_argument("--reload", action="store_true")
 
     args = parser.parse_args()
-
-    # Set global checkpoint path
     global MODEL_CHECKPOINT
     MODEL_CHECKPOINT = args.checkpoint
 
-    # Run the server
     uvicorn.run(
         "cowtracker_fastapi:app",
         host=args.host,
