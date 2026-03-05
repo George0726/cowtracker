@@ -32,6 +32,7 @@ Request example:
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -299,19 +300,29 @@ def encode_masks_to_video(
     return output_path
 
 
-def close_then_dilate(mask: np.ndarray, close_radius=6, dilate_radius=8) -> np.ndarray:
+def close_then_dilate(
+    mask: np.ndarray,
+    close_radius: int = 6,
+    dilate_radius: int = 8,
+    close_kernel: Optional[np.ndarray] = None,
+    dilate_kernel: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """Morph close then dilate (expects 2D mask)."""
     if mask.ndim == 3:
         mask = mask[..., 0]
     mask = (mask > 0).astype(np.uint8) * 255
 
-    k1 = 2 * int(close_radius) + 1
-    k2 = 2 * int(dilate_radius) + 1
-    ker1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k1, k1))
-    ker2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))
+    if close_kernel is None and int(close_radius) > 0:
+        k1 = 2 * int(close_radius) + 1
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k1, k1))
+    if dilate_kernel is None and int(dilate_radius) > 0:
+        k2 = 2 * int(dilate_radius) + 1
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))
 
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker1)
-    mask = cv2.dilate(mask, ker2, iterations=1)
+    if close_kernel is not None:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+    if dilate_kernel is not None:
+        mask = cv2.dilate(mask, dilate_kernel, iterations=1)
     return mask
 
 
@@ -324,6 +335,9 @@ def propagate_mask_with_cowtracker(
     vis_output_path: Optional[str] = None,
     close_radius: int = 6,
     dilate_radius: int = 8,
+    parallel_smoothing: bool = False,
+    smoothing_workers: int = 0,
+    smoothing_chunk_size: int = 16,
 ) -> List[np.ndarray]:
     """
     Propagate mask through frames using GLOBAL_MODEL (CoWTracker).
@@ -428,7 +442,12 @@ def propagate_mask_with_cowtracker(
     masks_out: List[np.ndarray] = [initial_mask.copy()]
     conf_thr = 0.1
 
+    projection_s = 0.0
+    morph_s = 0.0
+
+    # First build raw projected masks; run smoothing as a separate phase.
     for t in range(1, num_frames):
+        tp0 = time.time()
         xy_t = tracks_seed[:, t]  # [N,2]
         ix = xy_t[:, 0].astype(np.int32)
         iy = xy_t[:, 1].astype(np.int32)
@@ -444,16 +463,87 @@ def propagate_mask_with_cowtracker(
         mask_t = np.zeros((H, W), dtype=np.uint8)
         if np.any(valid):
             mask_t[iy[valid], ix[valid]] = 255
-
-        if enable_temporal_smoothing:
-            mask_t = close_then_dilate(
-                mask_t,
-                close_radius=close_radius,
-                dilate_radius=dilate_radius,
-            )
+        projection_s += time.time() - tp0
 
         masks_out.append(mask_t)
-    logger.info(f"Post-Processing done in {time.time() - t1:.2f}s")
+
+    if enable_temporal_smoothing and num_frames > 1:
+        tm0 = time.time()
+        n_masks = num_frames - 1
+        requested_workers = int(smoothing_workers)
+        workers = requested_workers if requested_workers > 0 else min(os.cpu_count() or 1, 8)
+        workers = max(1, min(workers, n_masks))
+        chunk_size = max(1, int(smoothing_chunk_size))
+
+        if parallel_smoothing and workers > 1:
+            logger.info(
+                f"Running parallel smoothing: workers={workers}, chunk_size={chunk_size}, frames={n_masks}"
+            )
+            close_kernel = None
+            dilate_kernel = None
+            if int(close_radius) > 0:
+                k1 = 2 * int(close_radius) + 1
+                close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k1, k1))
+            if int(dilate_radius) > 0:
+                k2 = 2 * int(dilate_radius) + 1
+                dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))
+
+            chunks = []
+            for start in range(1, num_frames, chunk_size):
+                end = min(start + chunk_size, num_frames)
+                chunks.append((start, end))
+
+            def _smooth_chunk(start_idx: int, end_idx: int):
+                out_chunk = []
+                for i in range(start_idx, end_idx):
+                    out_chunk.append(
+                        close_then_dilate(
+                            masks_out[i],
+                            close_kernel=close_kernel,
+                            dilate_kernel=dilate_kernel,
+                        )
+                    )
+                return start_idx, out_chunk
+
+            prev_cv_threads = cv2.getNumThreads()
+            cv2.setNumThreads(1)
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futures = [ex.submit(_smooth_chunk, s, e) for s, e in chunks]
+                    for fut in futures:
+                        start, out_chunk = fut.result()
+                        masks_out[start:start + len(out_chunk)] = out_chunk
+            except Exception as e:
+                logger.warning(f"Parallel smoothing failed ({e}); falling back to serial smoothing")
+                for i in range(1, num_frames):
+                    masks_out[i] = close_then_dilate(
+                        masks_out[i],
+                        close_kernel=close_kernel,
+                        dilate_kernel=dilate_kernel,
+                    )
+            finally:
+                cv2.setNumThreads(prev_cv_threads)
+        else:
+            close_kernel = None
+            dilate_kernel = None
+            if int(close_radius) > 0:
+                k1 = 2 * int(close_radius) + 1
+                close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k1, k1))
+            if int(dilate_radius) > 0:
+                k2 = 2 * int(dilate_radius) + 1
+                dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))
+            for i in range(1, num_frames):
+                masks_out[i] = close_then_dilate(
+                    masks_out[i],
+                    close_kernel=close_kernel,
+                    dilate_kernel=dilate_kernel,
+                )
+        morph_s = time.time() - tm0
+
+    logger.info(
+        f"Post-Processing done in {time.time() - t1:.2f}s "
+        f"(projection={projection_s:.2f}s, morph={morph_s:.2f}s)"
+    )
 
     # optional visualization (kept minimal)
     if visualize_tracks and vis_output_path:
@@ -487,6 +577,9 @@ class PropagatePathRequest(BaseModel):
     close_radius: int = 51
     dilate_radius: int = 8
     visualize: bool = False
+    parallel_smoothing: bool = False
+    smoothing_workers: int = 0
+    smoothing_chunk_size: int = 16
     encode_preset: str = "ultrafast"
     encode_crf: int = 30
     encode_codec: str = "libx264"
@@ -546,6 +639,9 @@ async def propagate_mask_from_paths(req: PropagatePathRequest):
             vis_output_path=None,
             close_radius=req.close_radius,
             dilate_radius=req.dilate_radius,
+            parallel_smoothing=req.parallel_smoothing,
+            smoothing_workers=req.smoothing_workers,
+            smoothing_chunk_size=req.smoothing_chunk_size,
         )
 
     save_t0 = time.time()
