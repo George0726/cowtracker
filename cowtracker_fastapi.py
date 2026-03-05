@@ -418,23 +418,42 @@ def propagate_mask_with_cowtracker(
         logger.warning("Initial mask empty")
         return [np.zeros((H, W), dtype=np.uint8) for _ in range(num_frames)]
 
-    masks_out: List[np.ndarray] = []
+    t1 = time.time()
+    # Vectorize pixel projection to avoid Python loops over mask pixels.
+    ys0 = mask_pixels[:, 0]
+    xs0 = mask_pixels[:, 1]
+    tracks_seed = tracks_np[ys0, xs0]  # [N,T,2]
+    conf_seed = conf_np[ys0, xs0]      # [N,T]
 
-    for t in range(num_frames):
-        if t == 0:
-            mask_t = initial_mask.copy()
-        else:
-            mask_t = np.zeros((H, W), dtype=np.uint8)
-            for my, mx in mask_pixels:
-                tx, ty = tracks_np[my, mx, t]
-                ix, iy = int(tx), int(ty)
-                if 0 <= ix < W and 0 <= iy < H and conf_np[my, mx, t] > 0.1:
-                    mask_t[iy, ix] = 255
+    masks_out: List[np.ndarray] = [initial_mask.copy()]
+    conf_thr = 0.1
 
-            if enable_temporal_smoothing:
-                mask_t = close_then_dilate(mask_t, close_radius=close_radius, dilate_radius=dilate_radius)
+    for t in range(1, num_frames):
+        xy_t = tracks_seed[:, t]  # [N,2]
+        ix = xy_t[:, 0].astype(np.int32)
+        iy = xy_t[:, 1].astype(np.int32)
+
+        valid = (
+            (ix >= 0)
+            & (ix < W)
+            & (iy >= 0)
+            & (iy < H)
+            & (conf_seed[:, t] > conf_thr)
+        )
+
+        mask_t = np.zeros((H, W), dtype=np.uint8)
+        if np.any(valid):
+            mask_t[iy[valid], ix[valid]] = 255
+
+        if enable_temporal_smoothing:
+            mask_t = close_then_dilate(
+                mask_t,
+                close_radius=close_radius,
+                dilate_radius=dilate_radius,
+            )
 
         masks_out.append(mask_t)
+    logger.info(f"Post-Processing done in {time.time() - t1:.2f}s")
 
     # optional visualization (kept minimal)
     if visualize_tracks and vis_output_path:
