@@ -32,14 +32,10 @@ Request example:
 
 import argparse
 import asyncio
-import io
 import json
 import logging
 import os
-import shutil
-import tempfile
 import time
-import uuid
 from contextlib import asynccontextmanager, nullcontext
 from typing import List, Optional, Tuple
 
@@ -49,10 +45,9 @@ import uvicorn
 import cv2
 import imageio.v2 as imageio
 import subprocess
-import numpy as np
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from PIL import Image
 
 # Import CoWTracker and utilities
@@ -243,29 +238,64 @@ def load_mask_gray(mask_path: str, target_size: Tuple[int, int]) -> np.ndarray:
     return (m > 127).astype(np.uint8) * 255
 
 
-def encode_masks_to_video(masks: List[np.ndarray], fps: float, output_path: str) -> str:
-    """Encode grayscale masks to mp4 (RGB in writer)."""
+def encode_masks_to_video(
+    masks: List[np.ndarray],
+    fps: float,
+    output_path: str,
+    preset: str = "ultrafast",
+    crf: int = 30,
+    codec: str = "libx264",
+    as_rgb: bool = True,
+) -> str:
+    """Encode masks to mp4 using ffmpeg rawvideo pipe."""
     if not masks:
         raise ValueError("No masks to encode")
 
-    writer = imageio.get_writer(
-        output_path,
-        fps=float(fps),
-        codec="libx264",
-        quality=5,
-        pixelformat="yuv420p",
-        ffmpeg_params=["-preset", "fast", "-crf", "23"],
-    )
+    h, w = masks[0].shape[:2]
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
+    input_pix_fmt = "rgb24" if as_rgb else "gray"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-v", "error",
+        "-f", "rawvideo",
+        "-pix_fmt", input_pix_fmt,
+        "-s", f"{w}x{h}",
+        "-r", f"{float(fps):.6f}",
+        "-i", "pipe:0",
+        "-an",
+        "-c:v", codec,
+        "-preset", preset,
+        "-crf", str(int(crf)),
+        "-pix_fmt", "yuv420p",
+        output_path,
+    ]
+
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         for mask in masks:
-            if mask.ndim == 2:
-                mask_rgb = np.stack([mask, mask, mask], axis=-1)
+            mask_gray = mask if mask.ndim == 2 else mask[..., 0]
+            if as_rgb:
+                mask_rgb = np.repeat(mask_gray[:, :, None], 3, axis=2)
+                p.stdin.write(np.ascontiguousarray(mask_rgb, dtype=np.uint8).tobytes())
             else:
-                mask_rgb = mask[..., :3]
-            writer.append_data(mask_rgb.astype(np.uint8))
+                p.stdin.write(np.ascontiguousarray(mask_gray, dtype=np.uint8).tobytes())
+        p.stdin.close()
+        stderr = p.stderr.read()
+        ret = p.wait()
+        if ret != 0:
+            raise RuntimeError(
+                f"ffmpeg encode failed:\n{stderr.decode('utf-8', errors='ignore')}"
+            )
     finally:
-        writer.close()
+        if p.stdin and not p.stdin.closed:
+            p.stdin.close()
+        if p.stderr:
+            p.stderr.close()
+
     return output_path
 
 
@@ -438,6 +468,10 @@ class PropagatePathRequest(BaseModel):
     close_radius: int = 51
     dilate_radius: int = 8
     visualize: bool = False
+    encode_preset: str = "ultrafast"
+    encode_crf: int = 30
+    encode_codec: str = "libx264"
+    encode_as_rgb: bool = True
 
 
 @app.get("/health")
@@ -495,9 +529,18 @@ async def propagate_mask_from_paths(req: PropagatePathRequest):
             dilate_radius=req.dilate_radius,
         )
 
-    encode_masks_to_video(masks, fps, output_path)
+    save_t0 = time.time()
+    encode_masks_to_video(
+        masks,
+        fps,
+        output_path,
+        preset=req.encode_preset,
+        crf=req.encode_crf,
+        codec=req.encode_codec,
+        as_rgb=req.encode_as_rgb,
+    )
 
-    logger.info(f"Saved output to {output_path}")
+    logger.info(f"Saved output to {output_path} in {time.time() - save_t0:.2f}s")
 
     return {
         "status": "success",
