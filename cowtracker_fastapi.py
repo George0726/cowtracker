@@ -33,6 +33,7 @@ Request example:
 import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import gc
 import json
 import logging
 import os
@@ -326,7 +327,7 @@ def close_then_dilate(
     return mask
 
 
-def propagate_mask_with_cowtracker(
+def _propagate_mask_single_window(
     frames: List[np.ndarray],
     initial_mask: np.ndarray,
     start_frame: int = 0,
@@ -563,6 +564,97 @@ def propagate_mask_with_cowtracker(
     return masks_out
 
 
+def propagate_mask_with_cowtracker(
+    frames: List[np.ndarray],
+    initial_mask: np.ndarray,
+    start_frame: int = 0,
+    enable_temporal_smoothing: bool = True,
+    visualize_tracks: bool = False,
+    vis_output_path: Optional[str] = None,
+    close_radius: int = 6,
+    dilate_radius: int = 8,
+    parallel_smoothing: bool = False,
+    smoothing_workers: int = 0,
+    smoothing_chunk_size: int = 16,
+    tile_size: int = 0,
+) -> List[np.ndarray]:
+    """
+    Propagate with optional recurrent sliding windows.
+
+    If tile_size > 1 and tile_size < num_frames, run windows with 1-frame overlap:
+    - first window: [0, tile_size)
+    - next window starts at previous window's last frame
+    - last output mask of previous window is reused as initial mask
+    """
+    num_frames = len(frames)
+    if num_frames == 0:
+        return []
+
+    # Single-shot path (original behavior)
+    if tile_size <= 1 or tile_size >= num_frames:
+        return _propagate_mask_single_window(
+            frames=frames,
+            initial_mask=initial_mask,
+            start_frame=start_frame,
+            enable_temporal_smoothing=enable_temporal_smoothing,
+            visualize_tracks=visualize_tracks,
+            vis_output_path=vis_output_path,
+            close_radius=close_radius,
+            dilate_radius=dilate_radius,
+            parallel_smoothing=parallel_smoothing,
+            smoothing_workers=smoothing_workers,
+            smoothing_chunk_size=smoothing_chunk_size,
+        )
+
+    window_size = int(tile_size)
+    logger.info(f"Sliding-window propagation enabled: tile_size={window_size}, total_frames={num_frames}")
+
+    all_masks: List[np.ndarray] = []
+    window_start = 0
+    current_init_mask = initial_mask
+    window_idx = 0
+
+    while window_start < num_frames:
+        window_end = min(window_start + window_size, num_frames)
+        window_frames = frames[window_start:window_end]
+        if not window_frames:
+            break
+
+        logger.info(
+            f"Window {window_idx}: frames [{window_start}, {window_end - 1}] "
+            f"(len={len(window_frames)})"
+        )
+
+        win_masks = _propagate_mask_single_window(
+            frames=window_frames,
+            initial_mask=current_init_mask,
+            start_frame=0,
+            enable_temporal_smoothing=enable_temporal_smoothing,
+            visualize_tracks=False,  # skip per-window vis to avoid repeated work
+            vis_output_path=None,
+            close_radius=close_radius,
+            dilate_radius=dilate_radius,
+            parallel_smoothing=parallel_smoothing,
+            smoothing_workers=smoothing_workers,
+            smoothing_chunk_size=smoothing_chunk_size,
+        )
+
+        if window_start == 0:
+            all_masks.extend(win_masks)
+        else:
+            # Drop first frame because it overlaps previous window's last frame.
+            all_masks.extend(win_masks[1:])
+
+        if window_end >= num_frames:
+            break
+
+        current_init_mask = win_masks[-1]
+        window_start = window_end - 1  # 1-frame overlap for recurrent input
+        window_idx += 1
+
+    return all_masks
+
+
 # ============================================================
 # ---------------------- API schema --------------------------
 # ============================================================
@@ -580,6 +672,8 @@ class PropagatePathRequest(BaseModel):
     parallel_smoothing: bool = False
     smoothing_workers: int = 0
     smoothing_chunk_size: int = 16
+    tile_size: int = 0
+    clear_cuda_cache: bool = True
     encode_preset: str = "ultrafast"
     encode_crf: int = 30
     encode_codec: str = "libx264"
@@ -598,6 +692,10 @@ async def health():
 
 @app.post("/propagate_path")
 async def propagate_mask_from_paths(req: PropagatePathRequest):
+    req_t0 = time.time()
+    decode_s = 0.0
+    infer_s = 0.0
+    save_s = 0.0
 
     if GLOBAL_MODEL is None:
         raise HTTPException(status_code=503, detail="Model not initialized")
@@ -622,13 +720,16 @@ async def propagate_mask_from_paths(req: PropagatePathRequest):
     logger.info(f"output={output_path}")
 
     # decode frames
+    t_decode0 = time.time()
     frames = read_rgb_frames(req.video_path, req.start_frame, end_frame)
+    decode_s = time.time() - t_decode0
 
     if not frames:
         raise HTTPException(400, "No frames decoded")
 
     initial_mask = load_mask_gray(req.mask_path, (width, height))
 
+    t_infer0 = time.time()
     async with GPU_LOCK:
         masks = propagate_mask_with_cowtracker(
             frames=frames,
@@ -642,7 +743,9 @@ async def propagate_mask_from_paths(req: PropagatePathRequest):
             parallel_smoothing=req.parallel_smoothing,
             smoothing_workers=req.smoothing_workers,
             smoothing_chunk_size=req.smoothing_chunk_size,
+            tile_size=req.tile_size,
         )
+    infer_s = time.time() - t_infer0
 
     save_t0 = time.time()
     encode_masks_to_video(
@@ -654,8 +757,24 @@ async def propagate_mask_from_paths(req: PropagatePathRequest):
         codec=req.encode_codec,
         as_rgb=req.encode_as_rgb,
     )
+    save_s = time.time() - save_t0
 
-    logger.info(f"Saved output to {output_path} in {time.time() - save_t0:.2f}s")
+    logger.info(f"Saved output to {output_path} in {save_s:.2f}s")
+
+    if req.clear_cuda_cache and torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        logger.info("CUDA cache cleanup completed")
+
+    total_s = time.time() - req_t0
+    logger.info(
+        f"Request total time: {total_s:.2f}s "
+        f"(decode={decode_s:.2f}s, infer+post={infer_s:.2f}s, save={save_s:.2f}s)"
+    )
 
     return {
         "status": "success",
