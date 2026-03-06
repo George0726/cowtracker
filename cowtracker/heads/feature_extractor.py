@@ -77,13 +77,19 @@ class FeatureExtractor(nn.Module):
         Returns:
             combined_features: [B, S, C, H_out, W_out] where C = features + side_resnet_channels.
         """
+        import time
+        t_total = time.time()
+
         B, S, _, H_img, W_img = images.shape
 
         # DPT features from backbone tokens
+        t_dpt = time.time()
         backbone_features = self.dpt_head(aggregated_tokens_list, images, patch_start_idx)
         _, _, _, H_out, W_out = backbone_features.shape
+        t_dpt = time.time() - t_dpt
 
         # Side ResNet features from raw images
+        t_side = time.time()
         images_flat = images.view(B * S, 3, H_img, W_img)
         side_features = self.fnet(images_flat)[0]
         _, side_channels, H_side, W_side = side_features.shape
@@ -95,6 +101,14 @@ class FeatureExtractor(nn.Module):
             )
 
         side_features = side_features.view(B, S, side_channels, H_out, W_out)
+        t_side = time.time() - t_side
+
+        t_total = time.time() - t_total
+
+        # Log timing once
+        if not hasattr(self, '_logged_timing'):
+            print(f"[FeatureExtractor TIMING] Total: {t_total:.3f}s | DPT: {t_dpt:.3f}s | SideResNet: {t_side:.3f}s")
+            self._logged_timing = True
 
         return torch.cat([backbone_features, side_features], dim=2)
 

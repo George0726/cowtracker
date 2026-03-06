@@ -70,12 +70,13 @@ class CoWTrackerWindowed(nn.Module, PyTorchModelHubMixin):
 
         B, T, C, H, W = images.shape
         device, dtype = images.device, images.dtype
+        output_device = device if self.training else torch.device("cpu")
 
         # Initialize accumulated outputs
         accumulated = {
-            "track": torch.zeros((B, T, H, W, 2), device=device, dtype=dtype),
-            "vis": torch.zeros((B, T, H, W), device=device, dtype=dtype),
-            "conf": torch.zeros((B, T, H, W), device=device, dtype=dtype),
+            "track": torch.zeros((B, T, H, W, 2), device=output_device, dtype=dtype),
+            "vis": torch.zeros((B, T, H, W), device=output_device, dtype=dtype),
+            "conf": torch.zeros((B, T, H, W), device=output_device, dtype=dtype),
         }
 
         windows = self.windowed.compute_windows(T)
@@ -103,8 +104,6 @@ class CoWTrackerWindowed(nn.Module, PyTorchModelHubMixin):
             # Split features: first_frame | memory | window
             first_frame_features = features[:, 0:1]
             num_memory = len(memory_indices)
-            offset = 1 + num_memory
-
             # Run tracking on extended features (memory + window), using first_frame as reference
             extended_features = features[:, 1:]  # Exclude first_frame from input
             pred = self.model.tracking_head(
@@ -119,17 +118,16 @@ class CoWTrackerWindowed(nn.Module, PyTorchModelHubMixin):
                 "vis": pred["vis"][:, num_memory:],
                 "conf": pred["conf"][:, num_memory:],
             }
+            if not self.training:
+                window_pred = {key: value.cpu() for key, value in window_pred.items()}
 
             # Merge into accumulated results
             self.windowed.merge_predictions(window_idx, start, end, window_pred, accumulated)
 
             # Cleanup for memory efficiency
             if not self.training:
-                del features, tokens, pred
+                del frames, features, tokens, pred, window_pred
                 torch.cuda.empty_cache()
-
-        if not self.training:
-            accumulated["images"] = images
 
         return accumulated
 
@@ -213,6 +211,7 @@ class CoWTrackerWindowed(nn.Module, PyTorchModelHubMixin):
         for p in model.parameters():
             p.requires_grad = False
 
+        # Enable torch.compile for faster inference
+
         print("Model loaded successfully!")
         return model
-

@@ -96,6 +96,9 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
                 - vis: Visibility scores [B, S, H, W].
                 - conf: Confidence scores [B, S, H, W].
         """
+        import time
+        t_total = time.time()
+
         # Normalize input
         images = video / 255.0
         if images.ndim == 4:
@@ -104,16 +107,28 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
         B, S, C, H, W = images.shape
 
         # Extract backbone tokens
+        t1 = time.time()
         tokens, patch_idx = self.aggregator(images)
+        t_agg = time.time() - t1
 
         # Extract high resolution features
+        t2 = time.time()
         features = self.feature_extractor(tokens, images, patch_idx)
+        t_feat = time.time() - t2
 
         # Run tracking
+        t3 = time.time()
         predictions = self.tracking_head(features, image_size=(H, W))
+        t_track = time.time() - t3
 
         if not self.training:
             predictions["images"] = images
+
+        t_total = time.time() - t_total
+        # Only log for first call to avoid spam
+        if not hasattr(self, '_logged_timing'):
+            self._logged_timing = True
+            print(f"[CoWTracker TIMING] Total: {t_total:.3f}s | Aggregator: {t_agg:.3f}s | FeatureExt: {t_feat:.3f}s | TrackingHead: {t_track:.3f}s")
 
         return predictions
 
@@ -223,6 +238,7 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
+
 
         print("Model loaded successfully!")
         return model

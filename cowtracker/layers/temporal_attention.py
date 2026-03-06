@@ -14,6 +14,21 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
+import os
+
+# Check if xformers should be used
+USE_XFORMERS = os.environ.get('COWTRACKER_USE_XFORMERS', '1').lower() not in ('0', 'false', 'no')
+
+try:
+    import xformers.ops as xops
+    if USE_XFORMERS:
+        print("use Flash attn")
+    else:
+        print("xFormers available but DISABLED by COWTRACKER_USE_XFORMERS env var")
+        xops = None
+except ImportError:
+    xops = None
+    print("xFormers not available")
 
 
 # ============================================================================
@@ -109,8 +124,20 @@ class MemEffAttention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
+        self.flash3_ops = self._get_flash_attention3_ops()
+
+    @staticmethod
+    def _get_flash_attention3_ops():
+        if xops is None or not torch.cuda.is_available():
+            return None
+        try:
+            return (xops.fmha.flash3.FwOp, xops.fmha.flash3.BwOp)
+        except AttributeError:
+            return None
 
     def forward(self, x: Tensor, pos=None) -> Tensor:
+        import time
+        t_start = time.time()
         B, N, C = x.shape
         qkv = (
             self.qkv(x)
@@ -124,18 +151,45 @@ class MemEffAttention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        if self.fused_attn:
+        t_attn_start = time.time()
+        if self.flash3_ops is not None and x.is_cuda:
+            attn_type = "flash3"
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+            x = xops.memory_efficient_attention(
+                q,
+                k,
+                v,
+                p=self.attn_drop.p if self.training else 0.0,
+                scale=self.scale,
+                op=self.flash3_ops,
+            )
+            x = x.reshape(B, N, C)
+        elif self.fused_attn:
+            attn_type = "sdpa"
             x = F.scaled_dot_product_attention(
                 q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0
             )
+            x = x.transpose(1, 2).reshape(B, N, C)
         else:
+            attn_type = "manual"
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
+            x = x.transpose(1, 2).reshape(B, N, C)
+        t_attn = time.time() - t_attn_start
 
-        x = x.transpose(1, 2).reshape(B, N, C)
+        # Log timing once
+        if not hasattr(self, '_logged_timing'):
+            print(f"[MemEffAttention TIMING] Type: {attn_type}, Attention: {t_attn*1000:.1f}ms, Total: {(time.time()-t_start)*1000:.1f}ms")
+            self._logged_timing = True
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

@@ -36,6 +36,7 @@ import gc
 import json
 import logging
 import os
+import sys
 import time
 from contextlib import asynccontextmanager, nullcontext
 from typing import List, Optional, Tuple
@@ -51,6 +52,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from PIL import Image
 
+# IMPORTANT: Parse args early to set env vars BEFORE importing CoWTracker
+# This ensures xformers toggle is respected by all modules
+early_args = sys.argv.copy()
+USE_XFORMERS = "--no-xformers" not in early_args  # Default: True, False if --no-xformers present
+os.environ['COWTRACKER_USE_XFORMERS'] = '1' if USE_XFORMERS else '0'
+
 # Import CoWTracker and utilities
 from cowtracker import CoWTracker
 from cowtracker.utils.padding import (
@@ -60,32 +67,50 @@ from cowtracker.utils.padding import (
 )
 
 # ---------------- logging ----------------
+# Configure root logger to ensure all logs are captured
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,  # Override any existing configuration
 )
 logger = logging.getLogger("cowtracker_api")
+# Ensure logger has a handler that outputs to stdout
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False  # Prevent duplicate logs from propagation
 
 # ---------------- global model state ----------------
 GLOBAL_MODEL = None
 GLOBAL_DEVICE = None
 GLOBAL_DTYPE = None
 MODEL_CHECKPOINT = None
+# USE_XFORMERS is computed above from sys.argv before CoWTracker import
 
 GPU_LOCK = asyncio.Lock()
 
 
-def initialize_model(checkpoint_path: Optional[str] = None):
+def initialize_model(
+    checkpoint_path: Optional[str] = None,
+    use_xformers: bool = True,
+):
     """Load the CoWTracker model once at startup."""
-    global GLOBAL_MODEL, GLOBAL_DEVICE, GLOBAL_DTYPE, MODEL_CHECKPOINT
+    global GLOBAL_MODEL, GLOBAL_DEVICE, GLOBAL_DTYPE, MODEL_CHECKPOINT, USE_XFORMERS
 
     MODEL_CHECKPOINT = checkpoint_path
+    USE_XFORMERS = use_xformers
+
+    # Note: COWTRACKER_USE_XFORMERS env var is set at module import time (before this function)
+
     GLOBAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     GLOBAL_DTYPE = torch.float16 if GLOBAL_DEVICE == "cuda" else torch.float32
 
     logger.info("=" * 60)
     logger.info(f"Initializing CoWTracker model on {GLOBAL_DEVICE} ...")
+    logger.info(f"xFormers Flash Attention: {'ENABLED' if USE_XFORMERS else 'DISABLED'}")
     logger.info("=" * 60)
 
     GLOBAL_MODEL = CoWTracker.from_checkpoint(
@@ -100,7 +125,9 @@ def initialize_model(checkpoint_path: Optional[str] = None):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting CoWTracker FastAPI Service...")
-    initialize_model(MODEL_CHECKPOINT)
+    # Read from env var to ensure consistency with early args parsing
+    use_xformers = os.environ.get('COWTRACKER_USE_XFORMERS', '1').lower() not in ('0', 'false', 'no')
+    initialize_model(MODEL_CHECKPOINT, use_xformers)
     yield
     logger.info("Shutting down CoWTracker FastAPI Service...")
 
@@ -352,6 +379,7 @@ def _propagate_mask_single_window(
     logger.info(f"CoWTracker tracking chunk: {num_frames} frames @ {H}x{W}, query={start_frame}")
 
     # video tensor [1,T,3,H,W]
+    t_prep = time.time()
     frames_np = np.stack(frames)  # [T,H,W,3]
     video_tensor = torch.from_numpy(frames_np).unsqueeze(0).to(GLOBAL_DTYPE)  # [1,T,H,W,3]
     video_tensor = video_tensor.permute(0, 1, 4, 2, 3).contiguous()  # [1,T,3,H,W]
@@ -365,6 +393,7 @@ def _propagate_mask_single_window(
     store_device = GLOBAL_DEVICE if GLOBAL_DEVICE == "cuda" else "cpu"
     traj_maps_e = torch.zeros((1, T, inf_H, inf_W, 2), dtype=torch.float32, device=store_device)
     visconf_maps_e = torch.zeros((1, T, inf_H, inf_W), dtype=torch.float32, device=store_device)
+    logger.info(f"[TIMING] Preprocessing: {time.time() - t_prep:.3f}s")
 
     # autocast safe
     autocast_ctx = (
@@ -376,9 +405,13 @@ def _propagate_mask_single_window(
     query_frame = int(start_frame)
 
     t0 = time.time()
+    t_forward = 0.0
+    t_backward = 0.0
+
     with torch.no_grad():
         # forward
         if query_frame < T - 1:
+            t_fwd_start = time.time()
             with autocast_ctx:
                 forward_video = video_tensor[0, query_frame:]  # [Tf,3,H,W]
                 forward_video_padded = apply_padding(forward_video, padding_info).to(GLOBAL_DEVICE)
@@ -391,9 +424,11 @@ def _propagate_mask_single_window(
                 Tf = tracks_dense.shape[0]
                 traj_maps_e[0, query_frame: query_frame + Tf] = tracks_dense.to(store_device)
                 visconf_maps_e[0, query_frame: query_frame + Tf] = (visibility_dense * confidence_dense).to(store_device)
+            t_forward = time.time() - t_fwd_start
 
         # backward
         if query_frame > 0:
+            t_bwd_start = time.time()
             with autocast_ctx:
                 backward_video = video_tensor[0, : query_frame + 1].flip([0])
                 backward_video_padded = apply_padding(backward_video, padding_info).to(GLOBAL_DEVICE)
@@ -409,8 +444,12 @@ def _propagate_mask_single_window(
                 end_idx = query_frame if query_frame < T - 1 else query_frame + 1
                 traj_maps_e[0, :end_idx] = backward_tracks[:end_idx]
                 visconf_maps_e[0, :end_idx] = backward_visconf[:end_idx]
+            t_backward = time.time() - t_bwd_start
+
+    logger.info(f"[TIMING] Tracking total: {time.time() - t0:.2f}s (forward={t_forward:.2f}s, backward={t_backward:.2f}s)")
 
     # remove padding and scale back (do on CPU to be safe)
+    t_pad = time.time()
     traj_cpu = traj_maps_e[0].to("cpu")
     visconf_cpu = visconf_maps_e[0].to("cpu")
 
@@ -420,8 +459,8 @@ def _propagate_mask_single_window(
         visconf_cpu,
         padding_info,
     )
-
-    logger.info(f"Tracking done in {time.time() - t0:.2f}s")
+    logger.info(f"[TIMING] Padding removal: {time.time() - t_pad:.3f}s")
+    logger.info(f"[TIMING] Full model inference: {time.time() - t0:.2f}s")
 
     # tracks_final: [T,H,W,2]?  (based on your original usage you permute later)
     tracks_np = tracks_final.permute(1, 2, 0, 3).numpy()   # [H,W,T,2]
@@ -444,6 +483,7 @@ def _propagate_mask_single_window(
 
     projection_s = 0.0
     morph_s = 0.0
+    smoothing_was_run = False
 
     # First build raw projected masks; run smoothing as a separate phase.
     for t in range(1, num_frames):
@@ -539,11 +579,18 @@ def _propagate_mask_single_window(
                     dilate_kernel=dilate_kernel,
                 )
         morph_s = time.time() - tm0
+        smoothing_was_run = True
 
-    logger.info(
-        f"Post-Processing done in {time.time() - t1:.2f}s "
-        f"(projection={projection_s:.2f}s, morph={morph_s:.2f}s)"
-    )
+    if smoothing_was_run:
+        logger.info(
+            f"Post-Processing done in {time.time() - t1:.2f}s "
+            f"(projection={projection_s:.2f}s, morph={morph_s:.2f}s)"
+        )
+    else:
+        logger.info(
+            f"Post-Processing done in {time.time() - t1:.2f}s "
+            f"(projection={projection_s:.2f}s, morph=skipped)"
+        )
 
     # optional visualization (kept minimal)
     if visualize_tracks and vis_output_path:
@@ -687,6 +734,7 @@ async def health():
         "model_loaded": GLOBAL_MODEL is not None,
         "device": GLOBAL_DEVICE,
         "dtype": str(GLOBAL_DTYPE),
+        "xformers_enabled": USE_XFORMERS,
     }
 
 
@@ -849,10 +897,15 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--checkpoint", "-c", type=str, default=None)
     parser.add_argument("--reload", action="store_true")
+    parser.add_argument("--no-xformers", action="store_true",
+                        help="Disable xformers Flash Attention (default: enabled)")
 
     args = parser.parse_args()
-    global MODEL_CHECKPOINT
+    global MODEL_CHECKPOINT, USE_XFORMERS
     MODEL_CHECKPOINT = args.checkpoint
+    USE_XFORMERS = not args.no_xformers  # Simple: default True, False if --no-xformers is set
+
+    logger.info(f"xFormers Flash Attention: {'ENABLED' if USE_XFORMERS else 'DISABLED'}")
 
     uvicorn.run(
         "cowtracker_fastapi:app",

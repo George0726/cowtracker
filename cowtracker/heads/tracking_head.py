@@ -6,6 +6,7 @@
 
 """CowTracker tracking head - Warping-based iterative refinement."""
 
+import time
 from typing import Tuple
 
 import torch
@@ -132,7 +133,10 @@ class CowTrackingHead(nn.Module):
         flow = torch.zeros(B, S, 2, H, W, device=features.device, dtype=features.dtype)
 
         # Iterative refinement
-        for _ in range(self.warp_iters):
+        t_iter_total = 0.0
+        t_transformer_total = 0.0
+        for i in range(self.warp_iters):
+            t_iter_start = time.time()
             flow = flow.detach()
 
             # Compute warped coordinates
@@ -150,7 +154,9 @@ class CowTrackingHead(nn.Module):
             ).view(B, S, -1, H, W)
 
             # Apply video transformer with temporal attention
+            t_trans_start = time.time()
             refine_out = self.refine_net(refine_inp)["out"]
+            t_transformer_total += time.time() - t_trans_start
 
             # Update hidden state
             net = self.refine_transform(
@@ -161,6 +167,11 @@ class CowTrackingHead(nn.Module):
             update = self.flow_head(net.view(B * S, -1, H, W)).view(B, S, 4, H, W)
             flow = flow + update[:, :, :2]
             info = update[:, :, 2:]
+            t_iter_total += time.time() - t_iter_start
+
+        if not hasattr(self, '_logged_timing'):
+            print(f"[TrackingHead TIMING] Iterations: {self.warp_iters}, Total: {t_iter_total:.3f}s, Transformer: {t_transformer_total:.3f}s ({100*t_transformer_total/t_iter_total:.1f}%)")
+            self._logged_timing = True
 
         # Upsample to original resolution
         weight = 0.25 * self.upsample_weight(net.view(B * S, -1, H, W)).view(B, S, -1, H, W)

@@ -354,10 +354,19 @@ class VisionTransformerVideo(nn.Module):
         """
         x: (B, T, C, H, W)
         """
+        import time
+        t_total = time.time()
+        t_patch_embed = 0.0
+        t_spatial = 0.0
+        t_temporal = 0.0
+        t_dpt = 0.0
+
         B, T, C, H, W = x.shape
         # Merge time into batch for per-frame spatial encoding
         x = x.view(B * T, C, H, W)
+        t_pe_start = time.time()
         x = self.patch_embed(x)  # (B*T, Np, D)
+        t_patch_embed += time.time() - t_pe_start
 
         x = x.view(B, T, *x.shape[1:])
         # Get time positional embedding for current T via linear interpolation: (1, T, D)
@@ -371,9 +380,13 @@ class VisionTransformerVideo(nn.Module):
         temporal_block_idx = 0
         for i in range(len(self.blks)):
             # 1) Spatial self-attention (per frame)
+            t_spat_start = time.time()
             x = self.blks[i](x)  # (B*T, Np, D)
+            t_spatial += time.time() - t_spat_start
+
             # 2) Interleave temporal self-attention (across frames, same spatial patch)
             if (i + 1) % self.temporal_interleave_stride == 0:
+                t_temp_start = time.time()
                 x = x.view(B, T, *x.shape[1:])
                 if self.shared_temporal_block:
                     x = self.temporal_block(x)
@@ -381,10 +394,13 @@ class VisionTransformerVideo(nn.Module):
                     x = self.temporal_blocks[temporal_block_idx](x)
                     temporal_block_idx += 1
                 x = x.view(B * T, *x.shape[2:])
+                t_temporal += time.time() - t_temp_start
+
             # 3) Collect intermediate features for DPT head
             if i in self.idx:
                 outputs.append([x])
 
+        t_dpt_start = time.time()
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
         # DPT head consumes (B*T, Np, D); here batch is B*T
         out, path_1, path_2, path_3, path_4 = self.dpt_head.forward(
@@ -394,12 +410,19 @@ class VisionTransformerVideo(nn.Module):
         out = F.interpolate(
             out, (H, W), mode="bilinear", align_corners=True
         )  # (B*T, Cout, H, W)
+        t_dpt += time.time() - t_dpt_start
 
         # Restore (B, T, ...)
         def bt_to_btensor(tensor_or_none):
             if tensor_or_none is None:
                 return None
             return tensor_or_none.view(B, T, *tensor_or_none.shape[1:])
+
+        t_total = time.time() - t_total
+        # Only log first call to avoid spam
+        if not hasattr(self, '_logged_timing'):
+            print(f"[VisionTransformerVideo TIMING] Total: {t_total:.3f}s | PatchEmbed: {t_patch_embed:.3f}s | Spatial: {t_spatial:.3f}s | Temporal: {t_temporal:.3f}s | DPT: {t_dpt:.3f}s")
+            self._logged_timing = True
 
         return {
             "out": out.view(B, T, *out.shape[1:]),
